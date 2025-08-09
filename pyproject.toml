@@ -1,0 +1,14 @@
+[project]
+name = "llmrec"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.99.5",
+    "pandas>=2.3.1",
+    "requests>=2.32.4",
+    "scikit-learn>=1.7.1",
+    "scipy>=1.15.3",
+    "torch>=2.8.0",
+]

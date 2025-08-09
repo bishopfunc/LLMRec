@@ -16,25 +16,25 @@ import requests
 file_path = ""
 
 
-# # MovieLens
-# def construct_prompting(item_attribute, indices): 
-#     # pre string
-#     pre_string = "You are now a search engines, and required to provide the inquired information of the given movies bellow:\n"
-#     # make item list
-#     item_list_string = ""
-#     for index in indices:
-#         title = item_attribute['title'][index]
-#         genre = item_attribute['genre'][index]
-#         item_list_string += "["
-#         item_list_string += str(index)
-#         item_list_string += "] "
-#         item_list_string += title + ", "
-#         item_list_string += genre + "\n"
-#     # output format
-#     output_format = "The inquired information is : director, country, language.\nAnd please output them in form of: \ndirector::country::language\nplease output only the content in the form above, i.e., director::country::language\n, but no other thing else, no reasoning, no index.\n\n"
-#     # make prompt
-#     prompt = pre_string + item_list_string + output_format
-#     return prompt 
+# MovieLens
+def construct_prompting(item_attribute, indices): 
+    # pre string
+    pre_string = "You are now a search engines, and required to provide the inquired information of the given movies bellow:\n"
+    # make item list
+    item_list_string = ""
+    for index in indices:
+        title = item_attribute['title'][index]
+        genre = item_attribute['genre'][index]
+        item_list_string += "["
+        item_list_string += str(index)
+        item_list_string += "] "
+        item_list_string += title + ", "
+        item_list_string += genre + "\n"
+    # output format
+    output_format = "The inquired information is : director, country, language.\nAnd please output them in form of: \ndirector::country::language\nplease output only the content in the form above, i.e., director::country::language\n, but no other thing else, no reasoning, no index.\n\n"
+    # make prompt
+    prompt = pre_string + item_list_string + output_format
+    return prompt 
 
 # Netflix
 def construct_prompting(item_attribute, indices): 

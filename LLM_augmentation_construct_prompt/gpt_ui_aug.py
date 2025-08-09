@@ -50,36 +50,36 @@ def construct_prompting(item_attribute, item_list, candidate_list):
     return prompt
 
 # # Netflix
-# def construct_prompting(item_attribute, item_list, candidate_list): 
-#     # make history string
-#     history_string = "User history:\n" 
-#     for index in item_list:
-#         year = item_attribute['year'][index]
-#         title = item_attribute['title'][index]
-#         history_string += "["
-#         history_string += str(index)
-#         history_string += "] "
-#         history_string += str(year) + ", "
-#         history_string += title + "\n"
-#     # make candidates
-#     candidate_string = "Candidates:\n" 
-#     for index in candidate_list:
-#         year = item_attribute['year'][index.item()]
-#         title = item_attribute['title'][index.item()]
-#         candidate_string += "["
-#         candidate_string += str(index.item())
-#         candidate_string += "] "
-#         candidate_string += str(year) + ", "
-#         candidate_string += title + "\n"
-#     # output format
-#     output_format = "Please output the index of user\'s favorite and least favorite movie only from candidate, but not user history. Please get the index from candidate, at the beginning of each line.\nOutput format:\nTwo numbers separated by '::'. Nothing else.Plese just give the index of candicates, remove [] (just output the digital value), please do not output other thing else, do not give reasoning.\n\n"
-#     # make prompt
-#     # prompt = "You are a movie recommendation system and required to recommend user with movies based on user history that each movie with title(same topic/doctor), year(similar years), genre(similar genre).\n"
-#     prompt = ""
-#     prompt += history_string
-#     prompt += candidate_string
-#     prompt += output_format
-#     return prompt
+def construct_prompting(item_attribute, item_list, candidate_list): 
+    # make history string
+    history_string = "User history:\n" 
+    for index in item_list:
+        year = item_attribute['year'][index]
+        title = item_attribute['title'][index]
+        history_string += "["
+        history_string += str(index)
+        history_string += "] "
+        history_string += str(year) + ", "
+        history_string += title + "\n"
+    # make candidates
+    candidate_string = "Candidates:\n" 
+    for index in candidate_list:
+        year = item_attribute['year'][index.item()]
+        title = item_attribute['title'][index.item()]
+        candidate_string += "["
+        candidate_string += str(index.item())
+        candidate_string += "] "
+        candidate_string += str(year) + ", "
+        candidate_string += title + "\n"
+    # output format
+    output_format = "Please output the index of user\'s favorite and least favorite movie only from candidate, but not user history. Please get the index from candidate, at the beginning of each line.\nOutput format:\nTwo numbers separated by '::'. Nothing else.Plese just give the index of candicates, remove [] (just output the digital value), please do not output other thing else, do not give reasoning.\n\n"
+    # make prompt
+    # prompt = "You are a movie recommendation system and required to recommend user with movies based on user history that each movie with title(same topic/doctor), year(similar years), genre(similar genre).\n"
+    prompt = ""
+    prompt += history_string
+    prompt += candidate_string
+    prompt += output_format
+    return prompt
 
 ### read candidate 
 candidate_indices = pickle.load(open(file_path + 'candidate_indices','rb'))

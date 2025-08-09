@@ -1,305 +1,336 @@
+"""ユーザ履歴 + 候補アイテムから好み(正例)/非好み(負例)サンプルを LLM に問い合わせるパイプライン。
 
-import threading
-import openai
-import time
-import pandas as pd
-import csv
-import requests
-import concurrent.futures
-import pickle
-import torch
+リファクタ方針:
+ - グローバル処理を排除しクラス/関数へ責務分割
+ - 冗長な再帰リトライを上限付き while ループへ置換
+ - 型ヒント / Docstring を全面追加
+ - I/O / LLM 要求 / プロンプト生成 / サンプル保存を疎結合化
+
+想定入出力ファイル (work_dir 配下):
+ - candidate_indices : pickle  (shape: [num_user, K])
+ - train_mat         : pickle  (各ユーザの疎行列またはテンソル list/array)
+ - item_attribute.csv: CSV (id,title,genre) あるいは (id,year,title) など
+ - augmented_sample_dict: 途中結果 (user_id -> {0:pos,1:neg})
+
+利用方法 (例):
+    python gpt_ui_aug.py --work_dir ./data --model gpt-3.5-turbo --start 0 --end 100
+
+環境変数:
+ - LLMREC_API_KEY  (Baidu / OpenAI 互換エンドポイントのトークン)
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
-import threading
+import pickle
 import time
-import tqdm
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, Tuple
+
+import pandas as pd
 import requests
 
-file_path = ""
-max_threads = 5
-cnt = 0 
 
-# MovieLens
-def construct_prompting(item_attribute, item_list, candidate_list): 
-    # make history string
-    history_string = "User history:\n" 
-    for index in item_list:
-        title = item_attribute['title'][index]
-        genre = item_attribute['genre'][index]
-        history_string += "["
-        history_string += str(index)
-        history_string += "] "
-        history_string += title + ", "
-        history_string += genre + "\n"
-    # make candidates
-    candidate_string = "Candidates:\n" 
-    for index in candidate_list:
-        title = item_attribute['title'][index.item()]
-        genre = item_attribute['genre'][index.item()]
-        candidate_string += "["
-        candidate_string += str(index.item())
-        candidate_string += "] "
-        candidate_string += title + ", "
-        candidate_string += genre + "\n"
-    # output format
-    output_format = "Please output the index of user\'s favorite and least favorite movie only from candidate, but not user history. Please get the index from candidate, at the beginning of each line.\nOutput format:\nTwo numbers separated by '::'. Nothing else.Plese just give the index of candicates, remove [] (just output the digital value), please do not output other thing else, do not give reasoning.\n\n"
-    # make prompt
-    prompt = "You are a movie recommendation system and required to recommend user with movies based on user history that each movie with title(same topic/doctor), year(similar years), genre(similar genre).\n"
-    prompt += history_string
-    prompt += candidate_string
-    prompt += output_format
-    return prompt
+# ============================================================
+# 設定 / コンフィグ
+# ============================================================
+@dataclass
+class LLMConfig:
+    """LLM 呼び出し関連設定。
 
-# # Netflix
-def construct_prompting(item_attribute, item_list, candidate_list): 
-    # make history string
-    history_string = "User history:\n" 
-    for index in item_list:
-        year = item_attribute['year'][index]
-        title = item_attribute['title'][index]
-        history_string += "["
-        history_string += str(index)
-        history_string += "] "
-        history_string += str(year) + ", "
-        history_string += title + "\n"
-    # make candidates
-    candidate_string = "Candidates:\n" 
-    for index in candidate_list:
-        year = item_attribute['year'][index.item()]
-        title = item_attribute['title'][index.item()]
-        candidate_string += "["
-        candidate_string += str(index.item())
-        candidate_string += "] "
-        candidate_string += str(year) + ", "
-        candidate_string += title + "\n"
-    # output format
-    output_format = "Please output the index of user\'s favorite and least favorite movie only from candidate, but not user history. Please get the index from candidate, at the beginning of each line.\nOutput format:\nTwo numbers separated by '::'. Nothing else.Plese just give the index of candicates, remove [] (just output the digital value), please do not output other thing else, do not give reasoning.\n\n"
-    # make prompt
-    # prompt = "You are a movie recommendation system and required to recommend user with movies based on user history that each movie with title(same topic/doctor), year(similar years), genre(similar genre).\n"
-    prompt = ""
-    prompt += history_string
-    prompt += candidate_string
-    prompt += output_format
-    return prompt
+    endpoint: Chat/Completion 互換のエンドポイント URL
+    model: 利用モデル名
+    api_key_env: API キーを格納した環境変数名
+    max_retries: 失敗時リトライ最大回数
+    retry_sleep: リトライ間隔秒
+    timeout: HTTP タイムアウト秒
+    """
 
-### read candidate 
-candidate_indices = pickle.load(open(file_path + 'candidate_indices','rb'))
-candidate_indices_dict = {}
-for index in range(candidate_indices.shape[0]):
-    candidate_indices_dict[index] = candidate_indices[index]
-### read adjacency_list
-adjacency_list_dict = {}
-train_mat = pickle.load(open(file_path + 'train_mat','rb'))
-for index in range(train_mat.shape[0]):
-    data_x, data_y = train_mat[index].nonzero()
-    adjacency_list_dict[index] = data_y
-### read item_attribute
-toy_item_attribute = pd.read_csv(file_path + 'item_attribute.csv', names=['id','title', 'genre'])
-### write augmented dict
-augmented_sample_dict = {}
-if os.path.exists(file_path + "augmented_sample_dict"): 
-    print(f"The file augmented_sample_dict exists.")
-    augmented_sample_dict = pickle.load(open(file_path + 'augmented_sample_dict','rb')) 
-else:
-    print(f"The file augmented_sample_dict does not exist.")
-    pickle.dump(augmented_sample_dict, open(file_path + 'augmented_sample_dict','wb')) 
+    endpoint: str = "http://llms-se.baidu-int.com:8200/chat/completions"
+    model: str = "gpt-3.5-turbo"
+    api_key_env: str = "LLMREC_API_KEY"  # 無い場合はヘッダに Authorization を付与しない
+    max_retries: int = 5
+    retry_sleep: float = 8.0
+    timeout: float = 60.0
 
-def file_reading():
-    augmented_attribute_dict = pickle.load(open(file_path + 'augmented_sample_dict','rb')) 
-    return augmented_attribute_dict
-
-# baidu
-def LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict):
-
-    try:
-        augmented_sample_dict = file_reading()
-    except pickle.UnpicklingError as e:
-        print("Error occurred while unpickling:", e) 
-        LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-    if index in augmented_sample_dict:
-        return 0
-    else:
-        try: 
-            print(f"{index}")
-            prompt = construct_prompting(toy_item_attribute, adjacency_list_dict[index], candidate_indices_dict[index])
-            url = "http://llms-se.baidu-int.com:8200/chat/completions"
-            headers={
-                # "Content-Type": "application/json",
-                "Authorization": "Bearer your key"
-            
-            }
-            params={
-                "model": model_type,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature":0.6,
-                "max_tokens": 1000,
-                "stream": False, 
-                "top_p": 0.1
-            }
-
-            response = requests.post(url=url, headers=headers,json=params)
-            message = response.json()
-
-            content = message['choices'][0]['message']['content']
-            print(f"content: {content}, model_type: {model_type}")
-            samples = content.split("::")
-            pos_sample = int(samples[0])
-            neg_sample = int(samples[1])
-            augmented_sample_dict[index] = {}
-            augmented_sample_dict[index][0] = pos_sample
-            augmented_sample_dict[index][1] = neg_sample
-            pickle.dump(augmented_sample_dict, open(file_path + 'augmented_sample_dict','wb'))
-
-        # except ValueError as e:
-        except requests.exceptions.RequestException as e:
-            print("An HTTP error occurred:", str(e))
-            time.sleep(10)
-        except ValueError as ve:
-            print("An error occurred while parsing the response:", str(ve))
-            time.sleep(10)
-            LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, "gpt-3.5-turbo-0613", augmented_sample_dict)
-        except KeyError as ke:
-            print("An error occurred while accessing the response:", str(ke))
-            time.sleep(10)
-            LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, "gpt-3.5-turbo-0613", augmented_sample_dict)
-        except Exception as ex:
-            print("An unknown error occurred:", str(ex))
-            time.sleep(10)
-        
-        return 1
+    def build_headers(self) -> Dict[str, str]:
+        key = os.getenv(self.api_key_env, "").strip()
+        if key:
+            return {"Authorization": f"Bearer {key}"}
+        # API Key 無しで動作させる場合 (社内ネットワーク限定など)
+        return {}
 
 
+# ============================================================
+# データアクセス
+# ============================================================
+@dataclass
+class DataRepository:
+    """学習に必要な各ファイルの読み書きを担当。"""
+
+    work_dir: str
+    candidate_file: str = "candidate_indices"
+    train_mat_file: str = "train_mat"
+    item_attribute_file: str = "item_attribute.csv"
+    augmented_file: str = "augmented_sample_dict"
+
+    # ---------- 読み込み ----------
+    def load_candidates(self) -> Dict[int, Sequence[int]]:
+        path = os.path.join(self.work_dir, self.candidate_file)
+        arr = pickle.load(open(path, "rb"))  # shape (U, K)
+        return {i: arr[i] for i in range(arr.shape[0])}
+
+    def load_train_mat(self) -> Dict[int, Sequence[int]]:
+        """train_mat からユーザ毎の履歴アイテム index 群を抽出。"""
+        path = os.path.join(self.work_dir, self.train_mat_file)
+        train_mat = pickle.load(open(path, "rb"))
+        history: Dict[int, Sequence[int]] = {}
+        for u in range(train_mat.shape[0]):
+            _, cols = train_mat[u].nonzero()
+            history[u] = cols
+        return history
+
+    def load_item_attribute(self) -> pd.DataFrame:
+        path = os.path.join(self.work_dir, self.item_attribute_file)
+        # 柔軟に列数対応: 3列 (id,title,genre) / 3列 (id,year,title) / 2列など
+        df = pd.read_csv(path, header=None)
+        # 列名推論
+        if df.shape[1] == 3:
+            # year が数値かどうかで分岐
+            if pd.api.types.is_integer_dtype(df[1]) or pd.api.types.is_float_dtype(
+                df[1]
+            ):
+                df.columns = ["id", "year", "title"]
+            else:
+                df.columns = ["id", "title", "genre"]
+        elif df.shape[1] >= 2:
+            df.columns = ["id", "title"] + [f"col{i}" for i in range(2, df.shape[1])]
+        else:
+            raise ValueError("item_attribute.csv の列数が不足しています")
+        return df
+
+    # ---------- augmented サンプル ----------
+    def load_augmented(self) -> Dict[int, Dict[int, int]]:
+        path = os.path.join(self.work_dir, self.augmented_file)
+        if os.path.exists(path):
+            try:
+                return pickle.load(open(path, "rb"))
+            except Exception as e:  # 破損時は新規
+                print(f"[WARN] augmented_sample_dict load failed: {e}; recreate empty.")
+        pickle.dump({}, open(path, "wb"))
+        return {}
+
+    def save_augmented(self, mapping: Dict[int, Dict[int, int]]) -> None:
+        path = os.path.join(self.work_dir, self.augmented_file)
+        pickle.dump(mapping, open(path, "wb"))
 
 
+# ============================================================
+# プロンプト生成
+# ============================================================
+class PromptBuilder:
+    """ユーザ履歴 + 候補集合からお気に入り/非お気に入りを 2 本抽出させる指示文を構築。"""
 
-# # chatgpt
-# def LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict):
+    OUTPUT_SPEC = (
+        "Please output the index of user's favorite and least favorite movie only from candidate, "
+        "but not user history. Please get the index from candidate, at the beginning of each line.\n"
+        "Output format:\nTwo numbers separated by '::'. Nothing else. "
+        "Please just give the index of candidates (digits only, no brackets), and no reasoning.\n\n"
+    )
 
-#     if index in augmented_sample_dict:
-#         print(f"g:{index}")
-#         return 0
-#     else:
-#         try: 
-#             print(f"{index}")
-#             prompt = construct_prompting(toy_item_attribute, adjacency_list_dict[index], candidate_indices_dict[index])
-#             # url = "http://llms-se.baidu-int.com:8200/chat/completions"
-#             # url = "https://api.openai.com/v1/completions"
-#             url = "https://api.openai.com/v1/chat/completions"
-
-#             headers={
-#                 # "Content-Type": "application/json",
-#                 # "Authorization": "Bearer your key"
-#                
-#             }
-#             # params={
-#             #     "model": model_type,
-#             #     "prompt": prompt,
-#             #     "max_tokens": 1024,
-#             #     "temperature": 0.6,
-#             #     "stream": False,
-#             # } 
-
-#             params = {
-#                 "model": "gpt-3.5-turbo",
-#                 "messages": [{"role": "system", "content": "You are a movie recommendation system and required to recommend user with movies based on user history that each movie with title(same topic/doctor), year(similar years), genre(similar genre).\n"}, {"role": "user", "content": prompt}]
-#             }
-
-#             response = requests.post(url=url, headers=headers,json=params)
-#             message = response.json()
-
-#             content = message['choices'][0]['message']['content']
-#             # content = message['choices'][0]['text']
-#             print(f"content: {content}, model_type: {model_type}")
-#             samples = content.split("::")
-#             pos_sample = int(samples[0])
-#             neg_sample = int(samples[1])
-#             augmented_sample_dict[index] = {}
-#             augmented_sample_dict[index][0] = pos_sample
-#             augmented_sample_dict[index][1] = neg_sample
-#             # pickle.dump(augmented_sample_dict, open('augmented_sample_dict','wb'))
-#             # pickle.dump(augmented_sample_dict, open('/Users/weiwei/Documents/Datasets/ml-10m/ml-10M100K/preprocessed_raw_MovieLens/toy_MovieLens1000/augmented_sample_dict','wb'))
-#             pickle.dump(augmented_sample_dict, open(file_path + 'augmented_sample_dict','wb'))
-
-#         # # except ValueError as e:
-#         # except requests.exceptions.RequestException as e:
-#         #     print("An HTTP error occurred:", str(e))
-#         #     # time.sleep(40)
-#         # except ValueError as ve:
-#         #     print("An error occurred while parsing the response:", str(ve))
-#         #     # time.sleep(40)
-#         #     LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, "gpt-3.5-turbo-0613", augmented_sample_dict)
-#         # except KeyError as ke:
-#         #     print("An error occurred while accessing the response:", str(ke))
-#         #     # time.sleep(40)
-#         #     LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, "gpt-3.5-turbo-0613", augmented_sample_dict)
-#         # except Exception as ex:
-#         #     print("An unknown error occurred:", str(ex))
-#         #     # time.sleep(40)
-        
-#         # return 1
-
-#         # except ValueError as e:
-#         except requests.exceptions.RequestException as e:
-#             print("An HTTP error occurred:", str(e))
-#             time.sleep(8)
-#             # print(content)
-#             # error_cnt += 1
-#             # if error_cnt==5:
-#             #     return 1
-#             # LLM_request(toy_item_attribute, indices, "gpt-3.5-turbo-0613", augmented_attribute_dict, error_cnt)
-#             LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-#         except ValueError as ve:
-#             print("ValueError error occurred while parsing the response:", str(ve))
-#             time.sleep(10)
-#             # error_cnt += 1
-#             # if error_cnt==5:
-#             #     return 1
-#             # print(content)
-#             # LLM_request(toy_item_attribute, indices, "gpt-3.5-turbo-0613", augmented_attribute_dict, error_cnt)
-#             LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-#         except KeyError as ke:
-#             print("KeyError error occurred while accessing the response:", str(ke))
-#             time.sleep(10)
-#             # error_cnt += 1
-#             # if error_cnt==5:
-#             #     return 1
-#             # print(content)
-#             # LLM_request(toy_item_attribute, indices, "gpt-3.5-turbo-0613", augmented_attribute_dict, error_cnt)
-#             LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-#         except IndexError as ke:
-#             print("IndexError error occurred while accessing the response:", str(ke))
-#             time.sleep(10)
-#             # error_cnt += 1
-#             # if error_cnt==5:
-#             #     return 1
-#             # # print(content)
-#             # LLM_request(toy_item_attribute, indices, "gpt-3.5-turbo-0613", augmented_attribute_dict)
-#             # return 1
-#             LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-#         except EOFError as ke:
-#             print("EOFError: : Ran out of input error occurred while accessing the response:", str(ke))
-#             time.sleep(10)
-#             # error_cnt += 1
-#             # if error_cnt==5:
-#             #     return 1
-#             # print(content)
-#             # LLM_request(toy_item_attribute, indices, "gpt-3.5-turbo-0613", augmented_attribute_dict, error_cnt)
-#             LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-#         except Exception as ex:
-#             print("An unknown error occurred:", str(ex))
-#             time.sleep(10)
-#             # error_cnt += 1
-#             # if error_cnt==5:
-#             #     return 1
-#             # print(content)
-#             # LLM_request(toy_item_attribute, indices, "gpt-3.5-turbo-0613", augmented_attribute_dict, error_cnt)
-#             LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, model_type, augmented_sample_dict)
-#         return 1
+    @staticmethod
+    def build(
+        item_df: pd.DataFrame, history: Sequence[int], candidates: Sequence[int]
+    ) -> str:
+        lines_hist = ["User history:"]
+        use_year = "year" in item_df.columns
+        for idx in history:
+            try:
+                title = item_df.loc[idx, "title"]
+                if use_year:
+                    year = item_df.loc[idx, "year"]
+                    lines_hist.append(f"[{idx}] {year}, {title}")
+                else:
+                    lines_hist.append(f"[{idx}] {title}")
+            except Exception:
+                continue
+        lines_cand = ["Candidates:"]
+        for c in candidates:
+            cid = c.item() if hasattr(c, "item") else int(c)
+            if cid in item_df.index:
+                title = item_df.loc[cid, "title"]
+                if use_year:
+                    year = item_df.loc[cid, "year"]
+                    lines_cand.append(f"[{cid}] {year}, {title}")
+                else:
+                    lines_cand.append(f"[{cid}] {title}")
+        return "\n".join(lines_hist + lines_cand) + "\n" + PromptBuilder.OUTPUT_SPEC
 
 
-for index in range(0, len(adjacency_list_dict)):
-    # # make prompting
-    re = LLM_request(toy_item_attribute, adjacency_list_dict, candidate_indices_dict, index, "gpt-3.5-turbo", augmented_sample_dict)
+# ============================================================
+# LLM クライアント
+# ============================================================
+class LLMClient:
+    """Chat Completion 互換 API を最小限で叩くクライアント。"""
+
+    def __init__(self, cfg: LLMConfig) -> None:
+        self.cfg = cfg
+
+    def sample(self, prompt: str) -> Optional[str]:
+        """プロンプトを送り raw content(文字列) を返す。失敗時 None。"""
+        headers = self.cfg.build_headers()
+        payload = {
+            "model": self.cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.6,
+            "max_tokens": 256,
+            "top_p": 0.1,
+            "stream": False,
+        }
+        for attempt in range(1, self.cfg.max_retries + 1):
+            try:
+                r = requests.post(
+                    self.cfg.endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.cfg.timeout,
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                print(f"[LLMClient] attempt {attempt} failed: {e}")
+                if attempt == self.cfg.max_retries:
+                    return None
+                time.sleep(self.cfg.retry_sleep)
+        return None
 
 
+# ============================================================
+# サンプル抽出パイプライン
+# ============================================================
+class PreferenceSampler:
+    """ユーザ毎に LLM から (pos, neg) を抽出し永続化。"""
+
+    def __init__(
+        self,
+        repo: DataRepository,
+        client: LLMClient,
+        item_df: pd.DataFrame,
+        history: Dict[int, Sequence[int]],
+        candidates: Dict[int, Sequence[int]],
+        augmented: Dict[int, Dict[int, int]],
+    ) -> None:
+        self.repo = repo
+        self.client = client
+        self.item_df = item_df
+        self.history = history
+        self.candidates = candidates
+        self.augmented = augmented  # user -> {0:pos,1:neg}
+
+    @staticmethod
+    def _parse_content(content: str) -> Optional[Tuple[int, int]]:
+        parts = [p.strip() for p in content.replace("\n", "").split("::") if p.strip()]
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+
+    def process_user(self, user_id: int) -> bool:
+        """単一ユーザを処理。既に存在すればスキップ。
+
+        戻り値: 新規取得=True / スキップ=False
+        """
+        if user_id in self.augmented:
+            return False
+        hist = self.history.get(user_id, [])
+        cand = self.candidates.get(user_id, [])
+        prompt = PromptBuilder.build(self.item_df, hist, cand)
+        content = self.client.sample(prompt)
+        if content is None:
+            return False
+        parsed = self._parse_content(content)
+        if not parsed:
+            print(f"[WARN] parse failed for user {user_id}: {content}")
+            return False
+        pos, neg = parsed
+        self.augmented[user_id] = {0: pos, 1: neg}
+        return True
+
+    def run(
+        self, start: int = 0, end: Optional[int] = None, save_interval: int = 50
+    ) -> None:
+        end = end if end is not None else max(self.history.keys()) + 1
+        processed = 0
+        for u in range(start, end):
+            new_flag = self.process_user(u)
+            if new_flag:
+                processed += 1
+            if (u + 1) % save_interval == 0:
+                self.repo.save_augmented(self.augmented)
+                print(f"[Progress] user {u + 1} saved (new={processed})")
+        # final save
+        self.repo.save_augmented(self.augmented)
+        print(f"[Done] total new={processed}, total users stored={len(self.augmented)}")
 
 
+# ============================================================
+# エントリポイント
+# ============================================================
+def run_pipeline(
+    work_dir: str,
+    model: str = "gpt-3.5-turbo",
+    start: int = 0,
+    end: Optional[int] = None,
+    endpoint: Optional[str] = None,
+) -> None:
+    """サンプル抽出パイプラインを実行。
+
+    endpoint: None の場合はデフォルト (LLMConfig.endpoint)
+    """
+
+    repo = DataRepository(work_dir)
+    item_df = repo.load_item_attribute()
+    history = repo.load_train_mat()
+    candidates = repo.load_candidates()
+    augmented = repo.load_augmented()
+
+    cfg = LLMConfig(model=model)
+    if endpoint:
+        cfg.endpoint = endpoint  # 動的差し替え
+    client = LLMClient(cfg)
+
+    sampler = PreferenceSampler(repo, client, item_df, history, candidates, augmented)
+    sampler.run(start=start, end=end)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Preference sampling via LLM")
+    p.add_argument(
+        "--work_dir",
+        type=str,
+        default="",
+        help="作業ディレクトリ (データファイル群置き場)",
+    )
+    p.add_argument("--model", type=str, default="gpt-3.5-turbo", help="モデル名")
+    p.add_argument("--endpoint", type=str, default=None, help="LLM エンドポイント URL")
+    p.add_argument("--start", type=int, default=0, help="開始ユーザ index")
+    p.add_argument(
+        "--end", type=int, default=None, help="終了ユーザ index (Python range 末端)"
+    )
+    return p
+
+
+if __name__ == "__main__":  # CLI 実行
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    run_pipeline(
+        work_dir=args.work_dir,
+        model=args.model,
+        start=args.start,
+        end=args.end,
+        endpoint=args.endpoint,
+    )

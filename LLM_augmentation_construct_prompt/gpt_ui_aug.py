@@ -24,12 +24,15 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import sys
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from utils.llm import LLMClient
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ============================================================

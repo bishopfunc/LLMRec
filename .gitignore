@@ -1,1 +1,5 @@
 *.pyc
+ml-10m.zip
+ml-10M100K/
+.env
+data/

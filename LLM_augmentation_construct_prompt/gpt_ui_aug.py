@@ -16,7 +16,7 @@
     python gpt_ui_aug.py --work_dir ./data --model gpt-3.5-turbo --start 0 --end 100
 
 環境変数:
- - LLMREC_API_KEY  (Baidu / OpenAI 互換エンドポイントのトークン)
+ - OPENAI_API_KEY  (Baidu / OpenAI 互換エンドポイントのトークン)
 """
 
 from __future__ import annotations
@@ -24,42 +24,12 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
-import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
 import pandas as pd
-import requests
 
-
-# ============================================================
-# 設定 / コンフィグ
-# ============================================================
-@dataclass
-class LLMConfig:
-    """LLM 呼び出し関連設定。
-
-    endpoint: Chat/Completion 互換のエンドポイント URL
-    model: 利用モデル名
-    api_key_env: API キーを格納した環境変数名
-    max_retries: 失敗時リトライ最大回数
-    retry_sleep: リトライ間隔秒
-    timeout: HTTP タイムアウト秒
-    """
-
-    endpoint: str = "http://llms-se.baidu-int.com:8200/chat/completions"
-    model: str = "gpt-3.5-turbo"
-    api_key_env: str = "LLMREC_API_KEY"  # 無い場合はヘッダに Authorization を付与しない
-    max_retries: int = 5
-    retry_sleep: float = 8.0
-    timeout: float = 60.0
-
-    def build_headers(self) -> Dict[str, str]:
-        key = os.getenv(self.api_key_env, "").strip()
-        if key:
-            return {"Authorization": f"Bearer {key}"}
-        # API Key 無しで動作させる場合 (社内ネットワーク限定など)
-        return {}
+from utils.llm import LLMClient
 
 
 # ============================================================
@@ -169,45 +139,6 @@ class PromptBuilder:
 
 
 # ============================================================
-# LLM クライアント
-# ============================================================
-class LLMClient:
-    """Chat Completion 互換 API を最小限で叩くクライアント。"""
-
-    def __init__(self, cfg: LLMConfig) -> None:
-        self.cfg = cfg
-
-    def sample(self, prompt: str) -> Optional[str]:
-        """プロンプトを送り raw content(文字列) を返す。失敗時 None。"""
-        headers = self.cfg.build_headers()
-        payload = {
-            "model": self.cfg.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.6,
-            "max_tokens": 256,
-            "top_p": 0.1,
-            "stream": False,
-        }
-        for attempt in range(1, self.cfg.max_retries + 1):
-            try:
-                r = requests.post(
-                    self.cfg.endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.cfg.timeout,
-                )
-                r.raise_for_status()
-                data = r.json()
-                return data["choices"][0]["message"]["content"].strip()
-            except Exception as e:
-                print(f"[LLMClient] attempt {attempt} failed: {e}")
-                if attempt == self.cfg.max_retries:
-                    return None
-                time.sleep(self.cfg.retry_sleep)
-        return None
-
-
-# ============================================================
 # サンプル抽出パイプライン
 # ============================================================
 class PreferenceSampler:
@@ -250,6 +181,7 @@ class PreferenceSampler:
         cand = self.candidates.get(user_id, [])
         prompt = PromptBuilder.build(self.item_df, hist, cand)
         content = self.client.sample(prompt)
+        print(f"[User {user_id}] Prompt:\n{prompt}\nResponse:\n{content}")
         if content is None:
             return False
         parsed = self._parse_content(content)
@@ -298,10 +230,7 @@ def run_pipeline(
     candidates = repo.load_candidates()
     augmented = repo.load_augmented()
 
-    cfg = LLMConfig(model=model)
-    if endpoint:
-        cfg.endpoint = endpoint  # 動的差し替え
-    client = LLMClient(cfg)
+    client = LLMClient()
 
     sampler = PreferenceSampler(repo, client, item_df, history, candidates, augmented)
     sampler.run(start=start, end=end)

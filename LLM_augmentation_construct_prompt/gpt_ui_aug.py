@@ -30,9 +30,9 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from utils.llm import LLMClient
-
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from utils.llm import LLMClient
 
 
 # ============================================================
